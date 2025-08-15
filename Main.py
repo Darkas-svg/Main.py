@@ -1,8 +1,7 @@
-from flask import Flask, request, Response, jsonify
-import os, requests, random, string, json
+from flask import Flask, request, Response, jsonify, make_response
+import os, requests, random, string, json, html
 
 app = Flask(__name__)
-# WICHTIG: Trailing Slashes zulassen → keine 308-Redirects
 app.url_map.strict_slashes = False
 
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", "").strip()
@@ -20,30 +19,77 @@ MODEL_ALIASES = {
 }
 
 def cors(resp: Response) -> Response:
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    # Weite CORS-Freigabe
+    resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*") or "*"
+    resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    resp.headers["Access-Control-Max-Age"] = "86400"
     return resp
 
 @app.after_request
 def after(resp):
     return cors(resp)
 
-# ---------- Health & Info ----------
+# -------------------- Health & Info --------------------
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify(ok=True, endpoint="chat/completions")
+    return jsonify(ok=True, endpoint="v1/chat/completions")
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    return jsonify(ok=True, path="v1/chat/completions", hint="POST hierher mit OpenAI-Chat-Payload.")
-
-@app.route("/health", methods=["GET"])
-def health():
     code = "ok-" + "".join(random.choices(string.ascii_letters + string.digits, k=8))
     return jsonify(ok=True, code=code)
 
-# ---------- Models (damit Janitor Endpoints findet) ----------
+# sehr simple Debug-Seite im Browser
+@app.route("/tester", methods=["GET"])
+def tester():
+    html_page = f"""<!doctype html>
+<html lang="de"><meta charset="utf-8"/>
+<title>Proxy Tester</title>
+<style>
+ body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem}}
+ textarea{{width:100%;height:160px}}
+ pre{{white-space:pre-wrap;background:#111;color:#eee;padding:1rem;border-radius:.5rem;overflow:auto}}
+ button{{padding:.6rem 1rem;border-radius:.5rem;border:0;background:#0a7;cursor:pointer}}
+</style>
+<h1>Proxy Tester</h1>
+<p>Testet <code>/v1/chat/completions</code> direkt vom Browser.</p>
+<p><strong>Hinweis:</strong> Dein OpenRouter-Key bleibt <em>serverseitig</em> – im Browser wird nichts verraten.</p>
+
+<label>Payload (OpenAI-Chat-Format):</label>
+<textarea id="payload">{{
+  "model": "deepseek/deepseek-chat:free",
+  "messages": [{{"role":"user","content":"Sag nur: Hallo von Darkas!"}}],
+  "stream": false
+}}</textarea>
+<br><br>
+<button id="go">Senden</button>
+<pre id="out">Noch nichts gesendet…</pre>
+
+<script>
+document.getElementById('go').onclick = async () => {{
+  const out = document.getElementById('out');
+  out.textContent = "Sende…";
+  try {{
+    const res = await fetch("{html.escape(request.url_root.rstrip('/'))}/v1/chat/completions", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: document.getElementById('payload').value
+    }});
+    const text = await res.text();
+    out.textContent = "HTTP " + res.status + "\\n\\n" + text;
+  }} catch (e) {{
+    out.textContent = "Fetch-Fehler: " + e;
+  }}
+}};
+</script>
+"""
+    resp = make_response(html_page)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
+# -------------------- Models (für UIs) --------------------
 def _models_payload():
     ids = sorted(set([
         "deepseek/deepseek-chat:free",
@@ -60,8 +106,14 @@ def _models_payload():
 def models():
     return jsonify(_models_payload())
 
-# ---------- Proxy Handler ----------
+# -------------------- Proxy Handler --------------------
 def handle_proxy():
+    # Logging ins Render-Log
+    try:
+        app.logger.info("REQ %s %s", request.method, request.path)
+    except Exception:
+        pass
+
     if request.method == "OPTIONS":
         return Response("", status=204)
 
@@ -128,12 +180,12 @@ def handle_proxy():
             resp.headers[k] = v
     return cors(resp)
 
-# Chat-Completions (mit & ohne Slash)
+# Chat-Completions – viele Varianten erlaubt
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS", "GET"])
 @app.route("/v1/chat/completions/", methods=["POST", "OPTIONS", "GET"])
 @app.route("/chat/completions", methods=["POST", "OPTIONS", "GET"])
 @app.route("/chat/completions/", methods=["POST", "OPTIONS", "GET"])
-# Legacy-OpenAI (falls ein Client das alte /completions nutzt)
+# Legacy
 @app.route("/v1/completions", methods=["POST", "OPTIONS", "GET"])
 @app.route("/completions", methods=["POST", "OPTIONS", "GET"])
 def proxy():
