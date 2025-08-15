@@ -1,5 +1,5 @@
-from flask import Flask, request, Response, jsonify
-import requests, os
+from flask import Flask, request, Response
+import requests, os, random, string
 
 app = Flask(__name__)
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
@@ -13,9 +13,11 @@ def cors(resp: Response) -> Response:
 
 @app.route("/health", methods=["GET"])
 def health():
-    return cors(Response("ok", status=200))
+    # zufälliger Code, damit du sicher siehst, dass der aktuelle Build läuft
+    code = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+    return cors(Response(f"ok-{code}", status=200))
 
-# Akzeptiere beide Pfade, falls Janitor /v1 davor setzt
+# Beide Pfade akzeptieren (Janitor nutzt teils /v1)
 @app.route("/chat/completions", methods=["POST", "OPTIONS"])
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def proxy():
@@ -25,25 +27,24 @@ def proxy():
     if not OPENROUTER_KEY:
         return cors(Response("Missing OPENROUTER_KEY", status=500))
 
-    # ---- Eingehenden Body robust normalisieren ----
+    # Request normalisieren
     data = request.get_json(silent=True) or {}
 
-    # Falls Janitor ein "prompt" sendet, in messages umwandeln
+    # prompt/input -> messages
     if "messages" not in data:
         if "prompt" in data:
             data["messages"] = [{"role": "user", "content": data.pop("prompt")}]
         elif "input" in data:
             data["messages"] = [{"role": "user", "content": data.pop("input")}]
 
-    # Model setzen, wenn fehlt
-    if "model" not in data or not data["model"]:
+    # Model setzen, falls fehlt
+    if not data.get("model"):
         data["model"] = DEFAULT_MODEL
 
-    # Stream optional vereinheitlichen
-    if "stream" not in data:
-        data["stream"] = False
-    # -----------------------------------------------
+    # Stream default
+    data.setdefault("stream", False)
 
+    # An OpenRouter weiterleiten
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
