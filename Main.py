@@ -1,37 +1,55 @@
+# Main.py
 from flask import Flask, request, Response, jsonify
-import requests, os, random, string, json
+import os, requests, random, string, json
 
 app = Flask(__name__)
 
-# === Konfiguration ===
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")  # MUSS gesetzt sein
-# Falls du später ein anderes Default willst, hier umstellen oder per Env:
-DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")  # MUSS gesetzt sein!
+DEFAULT_MODEL  = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
 
-# CORS-Helfer
-def cors(resp: Response) -> Response:
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+# Mögliche Alias-Namen aus Janitor normalisieren → OpenRouter-Slug
+MODEL_ALIASES = {
+    # DeepSeek v3 free Varianten
+    "deepseek-chat-v3-0324:free": "deepseek/deepseek-chat:free",
+    "deepseek-chat-v3:free":      "deepseek/deepseek-chat:free",
+    "deepseek-chat:free":         "deepseek/deepseek-chat:free",
+    "deepseek:free":              "deepseek/deepseek-chat:free",
+    "deepseekv3:free":            "deepseek/deepseek-chat:free",
+    "deepseek-v3:free":           "deepseek/deepseek-chat:free",
+
+    # Ohne „:free“ z. B. von Janitor
+    "deepseek/deepseek-chat:free": "deepseek/deepseek-chat:free",
+    "deepseek/deepseek-chat":      "deepseek/deepseek-chat:free",
+    "deepseek-chat-v3-0324":       "deepseek/deepseek-chat:free",
+    "deepseek-chat-v3":            "deepseek/deepseek-chat:free",
+    "deepseek-chat":               "deepseek/deepseek-chat:free",
+    "deepseek":                    "deepseek/deepseek-chat:free",
+
+    # Manchmal kommt nur "gpt-3.5-turbo" o.ä. – mappen wir auch auf DeepSeek-free
+    "gpt-3.5-turbo":               "deepseek/deepseek-chat:free",
+}
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# -------- Hilfen --------
+def _cors(resp: Response) -> Response:
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     return resp
 
-# Health mit Zufallscodes
-@app.route("/health", methods=["GET"])
-def health():
-    code = "".join(random.choices(string.ascii_letters + string.digits, k=8))
-    return cors(Response(json.dumps({"ok": True, "code": code, "endpoint": "v1/chat/completions"}), mimetype="application/json"))
+def _ok_json(data: dict, code=200):
+    return _cors(Response(json.dumps(data), status=code, mimetype="application/json"))
 
-# Root zeigt knappe Hilfe
-@app.route("/", methods=["GET"])
-def root():
-    return cors(Response(json.dumps({"ok": True, "endpoint": "v1/chat/completions"}), mimetype="application/json"))
+def _rand_token(n=8):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=n))
 
-# ---- Eingabe normalisieren (OpenAI- & Janitor-Varianten) ----
-def normalize_payload(data: dict) -> dict:
-    if not isinstance(data, dict):
+def _normalize_payload(data: dict) -> dict:
+    """Janitor schickt manchmal prompt/input statt messages – wir formen das passend um."""
+    if not data:
         data = {}
 
-    # messages konstruieren, falls nur "prompt" oder "input" kam
+    # 1) prompt/input -> messages
     if "messages" not in data:
         txt = data.get("prompt") or data.get("input")
         if isinstance(txt, list):
@@ -39,64 +57,70 @@ def normalize_payload(data: dict) -> dict:
         if txt:
             data["messages"] = [{"role": "user", "content": str(txt)}]
 
-    # Minimales Fallback
+    # 2) messages als Fallback
     if "messages" not in data or not data["messages"]:
-        data["messages"] = [{"role": "user", "content": "Hi"}]
+        data["messages"] = [{"role": "user", "content": "Hello!"}]
 
-    # Streaming standardmäßig aus, wenn es nicht explizit gesetzt wurde
+    # 3) Modell normalisieren
+    slug_in = str(data.get("model") or DEFAULT_MODEL)
+    slug = MODEL_ALIASES.get(slug_in, slug_in)
+    data["model"] = slug
+
+    # 4) Standard: kein Stream
     data.setdefault("stream", False)
-
-    # Egal, was client schickt → immer DeepSeek verwenden
-    data["model"] = DEFAULT_MODEL
-
     return data
 
-# ---- Proxy-Routen (mit & ohne /v1) ----
-@app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
-@app.route("/chat/completions", methods=["POST", "OPTIONS"])
-def proxy():
+# -------- Routen --------
+
+@app.route("/", methods=["GET"])
+def root():
+    return _ok_json({"ok": True, "endpoint": "chat/completions"})
+
+@app.route("/health", methods=["GET"])
+def health():
+    return _ok_json({"ok": True, "code": f"ok-{_rand_token()}"} )
+
+# Catch-All: akzeptiere *jeden* Pfad (GET/POST/OPTIONS).
+@app.route("/<path:anypath>", methods=["GET", "POST", "OPTIONS"])
+def catch_all(anypath: str):
+    # Für CORS-Preflight
     if request.method == "OPTIONS":
-        return cors(Response("", status=204))
+        return _cors(Response("", status=204))
 
-    # API-Key prüfen (nur Server-seitig)
+    # Wenn der Pfad nicht „completions“ enthält, nur Info ausgeben (kein 404).
+    if "completions" not in anypath:
+        return _ok_json({"ok": True, "info": "Proxy läuft. Verwende /v1/chat/completions oder /chat/completions."})
+
+    # Für GET (z.B. Janitor „Test“) einfach 200 OK zurückgeben
+    if request.method == "GET":
+        return _ok_json({"ok": True, "path": anypath, "hint": "POST hierher mit OpenAI-Chat-Payload."})
+
+    # Ab hier: POST → an OpenRouter weiterleiten
     if not OPENROUTER_KEY:
-        return cors(Response(json.dumps({"error": "Missing OPENROUTER_KEY"}), status=500, mimetype="application/json"))
+        return _ok_json({"error": "OPENROUTER_KEY fehlt in der Umgebung."}, code=500)
 
-    # JSON einlesen (ohne Exception)
     try:
         incoming = request.get_json(silent=True) or {}
-    except Exception:
-        incoming = {}
+        payload  = _normalize_payload(incoming)
 
-    # Nutzlast normalisieren und Modell festzurren
-    outgoing = normalize_payload(incoming)
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://janitor.ai",
+            "X-Title": "JanitorAI-Proxy",
+        }
 
-    # Anfrage an OpenRouter
-    try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json",
-                # Referrer/Title optional – schaden nicht:
-                "HTTP-Referer": "https://janitor.ai",
-                "X-Title": "JanitorAI-Proxy"
-            },
-            json=outgoing,
-            timeout=90
-        )
-    except requests.RequestException as e:
-        return cors(Response(json.dumps({"error": "Upstream request failed", "detail": str(e)}), status=502, mimetype="application/json"))
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
 
-    # Antwort 1:1 weiterreichen (Body & Header), aber CORS drüberlegen
-    resp = Response(r.content, status=r.status_code, mimetype=r.headers.get("Content-Type", "application/json"))
-    for k, v in r.headers.items():
-        # sicher ist sicher, nur sinnvolle Header kopieren
-        if k.lower() in ("content-type",):
+        # Antwort inkl. Header zurückreichen
+        resp = Response(r.content, status=r.status_code, mimetype="application/json")
+        for k, v in r.headers.items():
             resp.headers[k] = v
-    return cors(resp)
+        return _cors(resp)
 
-# ---- Start (lokal) ----
+    except Exception as e:
+        return _ok_json({"error": str(e)}, code=500)
+
+# Lokaler Start (Render nutzt Gunicorn/Startkommando)
 if __name__ == "__main__":
-    # Für Render läuft gunicorn, local zum Test so:
     app.run(host="0.0.0.0", port=8080)
