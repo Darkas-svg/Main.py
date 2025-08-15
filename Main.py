@@ -1,52 +1,37 @@
 from flask import Flask, request, Response
-import requests, os, random, string, json
+import requests, os, random, string
 
 app = Flask(__name__)
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
-DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
 
+# ---- ENV ----
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")                  # sk-or-...
+DEFAULT_MODEL  = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
+
+# Optional: Alias-Mapping, damit Janitor-Modelnamen sicher zu OpenRouter passen
 MODEL_ALIASES = {
     "deepseek-chat-v3-0324:free": "deepseek/deepseek-chat:free",
     "deepseek-chat-v3-0324":      "deepseek/deepseek-chat",
     "deepseek-chat":              "deepseek/deepseek-chat",
     "deepseek-v3":                "deepseek/deepseek-chat",
-    "deepseek/deepseek-chat-v3-0324:free": "deepseek/deepseek-chat:free",
 }
 
+# ---- Helpers ----
 def cors(resp: Response) -> Response:
-    h = resp.headers
-    h["Access-Control-Allow-Origin"] = "*"
-    h["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    h["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     return resp
 
-@app.route("/health", methods=["GET"])
-def health():
-    code = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-    return cors(Response(f"ok-{code}", status=200))
-
-# Akzeptiere mehrere Pfade wie UIs sie senden
-@app.route("/chat/completions", methods=["POST", "OPTIONS"])
-@app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
-@app.route("/v1/completions", methods=["POST", "OPTIONS"])
-def proxy():
-    if request.method == "OPTIONS":
-        return cors(Response("", status=204))
-    if not OPENROUTER_KEY:
-        return cors(Response("Missing OPENROUTER_KEY", status=500))
-
-    data = request.get_json(silent=True) or {}
-
-    # --- Normalisierung ---
-    # prompt/input -> messages
+def normalize_body(data: dict) -> dict:
+    # prompt/input → messages
     if "messages" not in data:
         txt = data.pop("prompt", None) or data.pop("input", None)
-        if isinstance(txt, list):  # manche UIs schicken list content
-            txt = " ".join(map(str, txt))
-        if txt:
+        if txt is not None:
+            if isinstance(txt, list):
+                txt = " ".join(map(str, txt))
             data["messages"] = [{"role": "user", "content": txt}]
 
-    # content evtl. als Liste -> string
+    # Falls message.content Listen/Objekte enthält → Text
     if "messages" in data:
         for m in data["messages"]:
             c = m.get("content")
@@ -56,28 +41,51 @@ def proxy():
                     for part in c
                 )
 
-    # Model setzen/umbenennen
+    # Model sicher setzen/mappen
     slug = data.get("model") or DEFAULT_MODEL
     slug = MODEL_ALIASES.get(slug, slug)
     data["model"] = slug
 
-    # Stream standardmäßig aus
+    # Standard: kein Stream
     data.setdefault("stream", False)
-    # ----------------------
+    return data
 
-    r = requests.post(
+# ---- Health (random) ----
+@app.route("/health", methods=["GET"])
+def health():
+    code = "".join(random.choices(string.ascii_letters + string.digits, k=8))
+    return cors(Response(f"ok-{code}", status=200))
+
+# ---- Proxy (nimmt mehrere Pfade an) ----
+@app.route("/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
+@app.route("/chat/completions",     methods=["GET", "POST", "OPTIONS"])
+@app.route("/v1/completions",       methods=["GET", "POST", "OPTIONS"])  # manche UIs
+def proxy():
+    if request.method == "OPTIONS":
+        return cors(Response("", status=204))
+    if request.method == "GET":
+        return cors(Response("ready", status=200))
+
+    if not OPENROUTER_KEY:
+        return cors(Response("Missing OPENROUTER_KEY", status=500))
+
+    data = request.get_json(silent=True) or {}
+    data = normalize_body(data)
+
+    upstream = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
-            "Content-Type": "application/json",
+            "Content-Type":  "application/json",
             "Authorization": f"Bearer {OPENROUTER_KEY}",
-            "HTTP-Referer": "https://janitor.ai",
-            "X-Title": "JanitorAI-Proxy"
+            "HTTP-Referer":  "https://janitor.ai",
+            "X-Title":       "JanitorAI-Proxy"
         },
         json=data,
         timeout=90
     )
-    resp = Response(r.content, status=r.status_code)
-    for k, v in r.headers.items():
+
+    resp = Response(upstream.content, status=upstream.status_code)
+    for k, v in upstream.headers.items():
         resp.headers[k] = v
     return cors(resp)
 
