@@ -3,124 +3,96 @@ import requests, os, random, string, json
 
 app = Flask(__name__)
 
-# ---- Config aus Umgebungsvariablen ----
-OPENROUTER_KEY   = os.getenv("OPENROUTER_KEY", "").strip()
-DEFAULT_MODEL    = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
+DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
 
-# Aliase erlauben flexible Model-Namen aus Janitor
+# Modell-Aliase
 MODEL_ALIASES = {
     "deepseek-chat-v3-0324:free": "deepseek/deepseek-chat:free",
     "deepseek-chat-v3-0324":      "deepseek/deepseek-chat",
-    "deepseek-chat":              "deepseek/deepseek-chat",
+    "deepseek-chat:":             "deepseek/deepseek-chat:",
     "deepseek-v3":                "deepseek/deepseek-chat",
-    "deepseek":                   "deepseek/deepseek-chat",
+    "deepseek/deepseek-chat-v3-0324:free": "deepseek/deepseek-chat:free",
 }
 
-# ---- CORS Helper ----
+# CORS-Helfer
 def cors(resp: Response) -> Response:
-    resp.headers["Access-Control-Allow-Origin"]  = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,HEAD"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    # Nimmt exakt die Header an, die der Browser anfragt
+    req_headers = request.headers.get("Access-Control-Request-Headers", "")
+    resp.headers["Access-Control-Allow-Headers"] = req_headers or "*"
+    resp.headers["Access-Control-Expose-Headers"] = "*"
     return resp
 
-# ---- Healthcheck (random Text) ----
+@app.after_request
+def add_cors_headers(r):
+    return cors(r)
+
+# Health-Check mit Zufallscode
 @app.route("/health", methods=["GET"])
 def health():
-    code = "".join(random.choices(string.ascii_letters + string.digits, k=8))
-    return cors(Response(f"ok-{code}", status=200, mimetype="text/plain"))
+    code = "".join(random.choices(string.ascii_letters + string.digits, k=6))
+    return cors(Response(f"ok-{code}", status=200))
 
-# ---- Body-Normalisierung (Janitor schickt verschiedenes) ----
-def normalize_body(data: dict) -> dict:
-    # prompt/input -> messages
+# Endpunkte /chat/completions und /v1/chat/completions
+@app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
+@app.route("/chat/completions", methods=["POST", "OPTIONS"])
+def proxy():
+    if request.method == "OPTIONS":
+        return cors(Response("", status=204))
+
+    if not OPENROUTER_KEY:
+        return cors(Response("Fehlender OPENROUTER_KEY", status=500))
+
+    data = request.get_json(silent=True) or {}
+
+    # Falls keine messages vorhanden, aus prompt bauen
     if "messages" not in data:
-        # text kann als "prompt" oder "input" kommen
         txt = data.pop("prompt", None) or data.pop("input", None)
-        if isinstance(txt, (list, tuple)):
+        if isinstance(txt, list):
             txt = " ".join(map(str, txt))
-        if isinstance(txt, (str, int, float)) and str(txt).strip():
-            data["messages"] = [{"role": "user", "content": str(txt)}]
+        if txt:
+            data["messages"] = [{"role": "user", "content": txt}]
 
-    # messages als String -> Liste
-    if isinstance(data.get("messages"), (str, int, float)):
-        data["messages"] = [{"role": "user", "content": str(data["messages"])}]
-
-    # content-Teile zusammenführen, falls Liste/Objekte
+    # content-Listen in Strings umwandeln
     if isinstance(data.get("messages"), list):
         for m in data["messages"]:
-            c = m.get("content")
-            if isinstance(c, list):
-                m["content"] = " ".join(part.get("text","") if isinstance(part,dict) else str(part) for part in c)
-            elif not isinstance(c, str):
-                m["content"] = str(c)
+            if isinstance(m, dict) and "content" in m:
+                c = m["content"]
+                if isinstance(c, list):
+                    m["content"] = " ".join(
+                        str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                        for part in c
+                    )
 
-    # Model auflösen/standardisieren
+    # Modell setzen
     slug = data.get("model") or DEFAULT_MODEL
     slug = MODEL_ALIASES.get(slug, slug)
     data["model"] = slug
 
-    # falls nicht gestreamt gewünscht
+    # Streaming deaktivieren
     data.setdefault("stream", False)
 
-    return data
-
-# ---- Standard-Endpoint, den Janitor erwartet ----
-@app.route("/v1/chat/completions", methods=["POST", "OPTIONS", "HEAD"])
-@app.route("/chat/completions",   methods=["POST", "OPTIONS", "HEAD"])  # falls du nur den kurzen Pfad nutzt
-def completions():
-    if request.method in ("OPTIONS", "HEAD"):
-        return cors(Response("", status=204))
-
-    if not OPENROUTER_KEY:
-        return cors(Response(json.dumps({"error": "Missing OPENROUTER_KEY"}), status=500, mimetype="application/json"))
-
-    data = request.get_json(silent=True) or {}
-    data = normalize_body(data)
-
     try:
-        upstream = requests.post(
+        r = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
-                "Content-Type":  "application/json",
+                "Content-Type": "application/json",
                 "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "HTTP-Referer":  "https://janitor.ai",
-                "X-Title":       "JanitorAI-Proxy",
+                "HTTP-Referer": "https://janitor.ai",
+                "X-Title": "JanitorAI-Proxy",
             },
             json=data,
             timeout=90,
         )
     except requests.RequestException as e:
-        return cors(Response(json.dumps({"error": "upstream_failed", "detail": str(e)}),
-                             status=502, mimetype="application/json"))
+        return cors(Response(json.dumps({"error": f"Upstream-Fehler: {str(e)}"}), status=502, mimetype="application/json"))
 
-    resp = Response(upstream.content, status=upstream.status_code)
-    # Header durchreichen (z. B. Ratelimits)
-    for k, v in upstream.headers.items():
+    resp = Response(r.content, status=r.status_code, mimetype=r.headers.get("Content-Type", "application/json"))
+    for k, v in r.headers.items():
         resp.headers[k] = v
     return cors(resp)
 
-# ---- Catch-all: GET = alive, POST/OPTIONS nur wenn Pfad stimmt ----
-@app.route("/<path:_path>", methods=["GET", "POST", "OPTIONS", "HEAD"])
-def catch_all(_path=""):
-    path = "/".join(p for p in _path.strip().split("/") if p).lower()
-    is_completions = (
-        path.rstrip("/").endswith("chat/completions")
-        or path.rstrip("/").endswith("/completions")
-    )
-
-    if request.method in ("OPTIONS", "HEAD"):
-        return cors(Response("", status=204))
-
-    if request.method == "GET":
-        # einfache Liveness-Antwort für irgendwelche GETs
-        return cors(Response("alive", 200, mimetype="text/plain"))
-
-    if not is_completions:
-        return cors(Response(json.dumps({"error": "wrong endpoint", "path": path}),
-                             status=404, mimetype="application/json"))
-
-    # Wenn es doch Completions ist, leite an die Hauptfunktion weiter
-    return completions()
-
 if __name__ == "__main__":
-    # Render lauscht standardmäßig auf 10000/8080 – 8080 ist safe
     app.run(host="0.0.0.0", port=8080)
