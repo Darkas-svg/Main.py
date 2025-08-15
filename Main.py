@@ -1,13 +1,13 @@
-# Main.py
 from flask import Flask, request, Response, jsonify
 import os, requests, random, string, json
 
 app = Flask(__name__)
+# WICHTIG: Trailing Slashes zulassen → keine 308-Redirects
+app.url_map.strict_slashes = False
 
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", "").strip()
 DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free").strip()
 
-# Alle sinnvollen Aliases -> OpenRouter-Slug
 MODEL_ALIASES = {
     "deepseek": "deepseek/deepseek-chat:free",
     "deepseek-chat": "deepseek/deepseek-chat:free",
@@ -19,7 +19,6 @@ MODEL_ALIASES = {
     "deepseek-chat-v3-0324:free": "deepseek/deepseek-chat:free",
 }
 
-# ---- CORS Helper -----------------------------------------------------------
 def cors(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
@@ -30,7 +29,7 @@ def cors(resp: Response) -> Response:
 def after(resp):
     return cors(resp)
 
-# ---- Health & Info ---------------------------------------------------------
+# ---------- Health & Info ----------
 @app.route("/", methods=["GET"])
 def root():
     return jsonify(ok=True, endpoint="chat/completions")
@@ -44,9 +43,8 @@ def health():
     code = "ok-" + "".join(random.choices(string.ascii_letters + string.digits, k=8))
     return jsonify(ok=True, code=code)
 
-# ---- Models (für Janitor „No endpoints found …“) ---------------------------
+# ---------- Models (damit Janitor Endpoints findet) ----------
 def _models_payload():
-    # Liefere mehrere IDs, damit Frontends „was finden“
     ids = sorted(set([
         "deepseek/deepseek-chat:free",
         "deepseek/deepseek-chat",
@@ -55,75 +53,59 @@ def _models_payload():
         "deepseek-chat-v3",
         "deepseek-chat-v3-0324:free",
     ]))
-    # OpenAI-kompatibel
-    data = {"object": "list", "data": [{"id": mid, "object": "model"} for mid in ids]}
-    return data
+    return {"object": "list", "data": [{"id": mid, "object": "model"} for mid in ids]}
 
 @app.route("/models", methods=["GET"])
 @app.route("/v1/models", methods=["GET"])
 def models():
     return jsonify(_models_payload())
 
-# ---- Chat Completions ------------------------------------------------------
-@app.route("/v1/chat/completions", methods=["POST", "OPTIONS", "GET"])
-@app.route("/chat/completions", methods=["POST", "OPTIONS", "GET"])
-def proxy():
-    # OPTIONS: CORS preflight
+# ---------- Proxy Handler ----------
+def handle_proxy():
     if request.method == "OPTIONS":
         return Response("", status=204)
 
-    # GET: freundlich antworten statt 405, damit Tests im Browser/Janitor grün sind
     if request.method == "GET":
         return jsonify(ok=True, path="v1/chat/completions",
                        hint="Bitte als POST mit JSON-Body im OpenAI-Chat-Format senden.")
 
     if not OPENROUTER_KEY:
-        return cors(Response(json.dumps({"error": "Missing OPENROUTER_KEY"}), status=500, mimetype="application/json"))
+        return cors(Response(json.dumps({"error": "Missing OPENROUTER_KEY"}),
+                             status=500, mimetype="application/json"))
 
-    # JSON holen (tolerant: auch leere Bodies)
-    try:
-        data = request.get_json(silent=True) or {}
-    except Exception:
-        data = {}
+    data = request.get_json(silent=True) or {}
 
-    # --- Prompt/Input -> messages umwandeln
+    # prompt/input -> messages
     if "messages" not in data:
-        txt = data.pop("prompt", None) or data.pop("input", None)
+        txt = data.pop("prompt", None) or data.pop("input", None) or data.get("content")
         if isinstance(txt, list):
             txt = "\n".join(map(str, txt))
-        if txt is None:
-            # evtl. aus "content" (manche Tools schicken nur das)
-            txt = data.get("content")
         if txt:
             data["messages"] = [{"role": "user", "content": str(txt)}]
 
-    # Falls messages vorhanden aber nicht im gewünschten Format: flachziehen
+    # messages säubern
     if isinstance(data.get("messages"), list):
         msgs = []
         for m in data["messages"]:
             if isinstance(m, dict) and "content" in m:
-                # content-Teile (strings/objekte) zu einem String joinen
                 c = m["content"]
                 if isinstance(c, list):
                     text = " ".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in c)
                 else:
                     text = str(c)
-                role = m.get("role", "user")
-                msgs.append({"role": role, "content": text})
+                msgs.append({"role": m.get("role", "user"), "content": text})
             elif isinstance(m, str):
                 msgs.append({"role": "user", "content": m})
         if msgs:
             data["messages"] = msgs
 
-    # --- Modell setzen/normalisieren
+    # Modell normalisieren
     wanted = (data.get("model") or DEFAULT_MODEL).strip()
     slug = MODEL_ALIASES.get(wanted, wanted)
     data["model"] = slug
 
-    # --- Defaults
     data.setdefault("stream", False)
 
-    # --- Upstream an OpenRouter
     try:
         r = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -140,15 +122,22 @@ def proxy():
     except requests.RequestException as e:
         return cors(Response(json.dumps({"error": str(e)}), status=502, mimetype="application/json"))
 
-    # Antwort & Header durchreichen
     resp = Response(r.content, status=r.status_code)
     for k, v in r.headers.items():
-        # sicherheitshalber keine hop-by-hop Header übernehmen
         if k.lower() not in {"content-length", "transfer-encoding", "connection"}:
             resp.headers[k] = v
     return cors(resp)
 
-# ---- Start (Render verwendet Gunicorn; lokal geht app.run) -----------------
+# Chat-Completions (mit & ohne Slash)
+@app.route("/v1/chat/completions", methods=["POST", "OPTIONS", "GET"])
+@app.route("/v1/chat/completions/", methods=["POST", "OPTIONS", "GET"])
+@app.route("/chat/completions", methods=["POST", "OPTIONS", "GET"])
+@app.route("/chat/completions/", methods=["POST", "OPTIONS", "GET"])
+# Legacy-OpenAI (falls ein Client das alte /completions nutzt)
+@app.route("/v1/completions", methods=["POST", "OPTIONS", "GET"])
+@app.route("/completions", methods=["POST", "OPTIONS", "GET"])
+def proxy():
+    return handle_proxy()
+
 if __name__ == "__main__":
-    # Lokal testen: python Main.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
