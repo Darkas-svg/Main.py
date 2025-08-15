@@ -3,11 +3,9 @@ import requests, os, random, string
 
 app = Flask(__name__)
 
-# ---- ENV ----
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")                  # sk-or-...
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 DEFAULT_MODEL  = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat:free")
 
-# Optional: Alias-Mapping, damit Janitor-Modelnamen sicher zu OpenRouter passen
 MODEL_ALIASES = {
     "deepseek-chat-v3-0324:free": "deepseek/deepseek-chat:free",
     "deepseek-chat-v3-0324":      "deepseek/deepseek-chat",
@@ -15,23 +13,19 @@ MODEL_ALIASES = {
     "deepseek-v3":                "deepseek/deepseek-chat",
 }
 
-# ---- Helpers ----
 def cors(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Origin"]  = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,HEAD"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     return resp
 
 def normalize_body(data: dict) -> dict:
-    # prompt/input → messages
     if "messages" not in data:
         txt = data.pop("prompt", None) or data.pop("input", None)
         if txt is not None:
             if isinstance(txt, list):
                 txt = " ".join(map(str, txt))
             data["messages"] = [{"role": "user", "content": txt}]
-
-    # Falls message.content Listen/Objekte enthält → Text
     if "messages" in data:
         for m in data["messages"]:
             c = m.get("content")
@@ -40,28 +34,28 @@ def normalize_body(data: dict) -> dict:
                     part.get("text", "") if isinstance(part, dict) else str(part)
                     for part in c
                 )
-
-    # Model sicher setzen/mappen
     slug = data.get("model") or DEFAULT_MODEL
     slug = MODEL_ALIASES.get(slug, slug)
     data["model"] = slug
-
-    # Standard: kein Stream
     data.setdefault("stream", False)
     return data
 
-# ---- Health (random) ----
+# ---- Probes ----
+@app.route("/", methods=["GET","HEAD"])
+def root():
+    return cors(Response("alive", status=200))
+
 @app.route("/health", methods=["GET"])
 def health():
     code = "".join(random.choices(string.ascii_letters + string.digits, k=8))
     return cors(Response(f"ok-{code}", status=200))
 
-# ---- Proxy (nimmt mehrere Pfade an) ----
-@app.route("/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
-@app.route("/chat/completions",     methods=["GET", "POST", "OPTIONS"])
-@app.route("/v1/completions",       methods=["GET", "POST", "OPTIONS"])  # manche UIs
+# ---- Proxy ----
+@app.route("/v1/chat/completions", methods=["GET","POST","OPTIONS","HEAD"])
+@app.route("/chat/completions",     methods=["GET","POST","OPTIONS","HEAD"])
+@app.route("/v1/completions",       methods=["GET","POST","OPTIONS","HEAD"])
 def proxy():
-    if request.method == "OPTIONS":
+    if request.method in ("OPTIONS","HEAD"):
         return cors(Response("", status=204))
     if request.method == "GET":
         return cors(Response("ready", status=200))
@@ -78,10 +72,10 @@ def proxy():
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {OPENROUTER_KEY}",
             "HTTP-Referer":  "https://janitor.ai",
-            "X-Title":       "JanitorAI-Proxy"
+            "X-Title":       "JanitorAI-Proxy",
         },
         json=data,
-        timeout=90
+        timeout=90,
     )
 
     resp = Response(upstream.content, status=upstream.status_code)
