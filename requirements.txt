@@ -1,2 +1,4 @@
 flask
 requests
+# optional (wenn du bei Render im Start Command Gunicorn nutzt):
+gunicorn
